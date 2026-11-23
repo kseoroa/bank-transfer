@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 
 import com.kyongseo.banktransfer.account.Account;
 import com.kyongseo.banktransfer.account.AccountRepository;
+import com.kyongseo.banktransfer.global.exception.BusinessException;
+import com.kyongseo.banktransfer.global.exception.ErrorCode;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,13 +18,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * 2단계: 락 없는 이체에서 동시 요청 시 lost update가 발생함을 실제 MySQL로 재현한다.
- * 현재는 실패하는 것이 정상(재현 성공)이며, 3단계에서 동시성 제어를 넣으면 통과해야 한다.
+ * 같은 계좌(A)에 이체가 몰리는 상황. 2단계에서 lost update를 재현한 조건 그대로
+ * 비관적 락과 낙관적 락을 각각 실행해 비교한다.
  */
 @SpringBootTest(properties = "spring.jpa.show-sql=false")
 class TransferConcurrencyTest {
@@ -38,6 +41,9 @@ class TransferConcurrencyTest {
     @Autowired
     private AccountRepository accountRepository;
 
+    @Autowired
+    private TransferMetrics metrics;
+
     private Account accountA;
     private Account accountB;
 
@@ -46,6 +52,7 @@ class TransferConcurrencyTest {
         String suffix = String.valueOf(System.nanoTime() % 1_000_000_000L);
         accountA = accountRepository.save(new Account("CA" + suffix, "A", INITIAL_BALANCE_A));
         accountB = accountRepository.save(new Account("CB" + suffix, "B", 0));
+        metrics.reset();
     }
 
     @AfterEach
@@ -53,9 +60,10 @@ class TransferConcurrencyTest {
         accountRepository.deleteAllById(List.of(accountA.getId(), accountB.getId()));
     }
 
-    @Test
-    @DisplayName("A(100,000원)에서 B로 1,000원씩 100건 동시 이체하면 A=0, B=100,000이어야 한다")
-    void concurrentTransfers() throws InterruptedException {
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(LockStrategy.class)
+    @DisplayName("A(100,000원)에서 B로 1,000원씩 100건 동시 이체: 성공한 이체는 하나도 유실되지 않아야 한다")
+    void concurrentTransfers(LockStrategy strategy) throws InterruptedException {
         ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
         CountDownLatch startSignal = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(REQUEST_COUNT);
@@ -67,11 +75,10 @@ class TransferConcurrencyTest {
                 try {
                     startSignal.await();
                     transferService.transfer(
-                            accountA.getAccountNumber(), accountB.getAccountNumber(), TRANSFER_AMOUNT);
+                            accountA.getAccountNumber(), accountB.getAccountNumber(), TRANSFER_AMOUNT, strategy);
                     successCount.incrementAndGet();
                 } catch (Exception e) {
-                    failures.computeIfAbsent(e.getClass().getSimpleName(), k -> new AtomicInteger())
-                            .incrementAndGet();
+                    failures.computeIfAbsent(failureKey(e), k -> new AtomicInteger()).incrementAndGet();
                 } finally {
                     done.countDown();
                 }
@@ -86,30 +93,42 @@ class TransferConcurrencyTest {
 
         long actualA = accountRepository.findById(accountA.getId()).orElseThrow().getBalance();
         long actualB = accountRepository.findById(accountB.getId()).orElseThrow().getBalance();
-        long expectedA = INITIAL_BALANCE_A - TRANSFER_AMOUNT * REQUEST_COUNT;
-        long expectedB = TRANSFER_AMOUNT * REQUEST_COUNT;
+        int success = successCount.get();
+        int failureCount = failures.values().stream().mapToInt(AtomicInteger::get).sum();
+        // 성공한 이체만큼 정확히 이동했어야 한다 (lost update가 있으면 깨진다)
+        long expectedA = INITIAL_BALANCE_A - TRANSFER_AMOUNT * success;
+        long expectedB = TRANSFER_AMOUNT * success;
 
-        printReport(finished, elapsedMillis, successCount.get(), failures, expectedA, actualA, expectedB, actualB);
+        System.out.println();
+        System.out.printf("========== 동시 이체 결과 [%s] ==========%n", strategy);
+        System.out.printf("요청 %d건 / 성공 %d건 / 실패 %d건 %s / 60초 내 완료: %s%n",
+                REQUEST_COUNT, success, failureCount, failures.isEmpty() ? "" : failures, finished);
+        System.out.printf("재시도 %d회 (낙관적 락 충돌 후 재시도) / 걸린 시간: %,d ms%n",
+                metrics.optimisticRetries(), elapsedMillis);
+        System.out.printf("%-8s %12s %12s%n", "", "기대값", "실제값");
+        System.out.printf("%-8s %,12d %,12d%n", "A 잔액", expectedA, actualA);
+        System.out.printf("%-8s %,12d %,12d%n", "B 잔액", expectedB, actualB);
+        System.out.println("(기대값 = 성공 건수만큼 이동한 잔액)");
+        System.out.println("==========================================");
+        System.out.println();
 
         assertAll(
-                () -> assertThat(actualA).as("A 잔액").isEqualTo(expectedA),
-                () -> assertThat(actualB).as("B 잔액").isEqualTo(expectedB)
+                () -> assertThat(finished).as("시간 내 완료").isTrue(),
+                () -> assertThat(success + failureCount).as("응답 건수").isEqualTo(REQUEST_COUNT),
+                () -> assertThat(actualA).as("A 잔액 (성공 건수 기준)").isEqualTo(expectedA),
+                () -> assertThat(actualB).as("B 잔액 (성공 건수 기준)").isEqualTo(expectedB),
+                () -> {
+                    if (strategy == LockStrategy.PESSIMISTIC) {
+                        assertThat(success).as("비관적 락은 전부 성공").isEqualTo(REQUEST_COUNT);
+                    } else {
+                        assertThat(failures.keySet()).as("낙관적 락 실패 사유는 재시도 소진뿐")
+                                .isSubsetOf(ErrorCode.TRANSFER_CONFLICT.name());
+                    }
+                }
         );
     }
 
-    private void printReport(boolean finished, long elapsedMillis, int success, Map<String, AtomicInteger> failures,
-                             long expectedA, long actualA, long expectedB, long actualB) {
-        System.out.println();
-        System.out.println("========== 동시 이체 결과 ==========");
-        System.out.printf("요청 %d건 / 성공 %d건 / 실패 %s / 60초 내 완료: %s%n",
-                REQUEST_COUNT, success, failures.isEmpty() ? "0건" : failures, finished);
-        System.out.printf("걸린 시간: %,d ms%n", elapsedMillis);
-        System.out.printf("%-8s %12s %12s %12s%n", "", "기대값", "실제값", "차이");
-        System.out.printf("%-8s %,12d %,12d %,12d%n", "A 잔액", expectedA, actualA, actualA - expectedA);
-        System.out.printf("%-8s %,12d %,12d %,12d%n", "B 잔액", expectedB, actualB, actualB - expectedB);
-        System.out.printf("%-8s %,12d %,12d %,12d%n", "A+B 합계",
-                expectedA + expectedB, actualA + actualB, (actualA + actualB) - (expectedA + expectedB));
-        System.out.println("====================================");
-        System.out.println();
+    private static String failureKey(Exception e) {
+        return e instanceof BusinessException be ? be.getErrorCode().name() : e.getClass().getSimpleName();
     }
 }

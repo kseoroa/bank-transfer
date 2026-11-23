@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 
 import com.kyongseo.banktransfer.account.Account;
 import com.kyongseo.banktransfer.account.AccountRepository;
+import com.kyongseo.banktransfer.global.exception.BusinessException;
+import com.kyongseo.banktransfer.global.exception.ErrorCode;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,13 +18,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * 3단계: 비관적 락 환경에서 A→B, B→A 이체가 동시에 일어날 때 데드락이 생기지 않아야 한다.
- * 락을 "보내는 계좌 → 받는 계좌" 순서로 잡으면 두 방향이 서로의 락을 기다리며 데드락이 난다.
+ * A→B, B→A 이체가 동시에 일어날 때 데드락이 없어야 한다.
+ * 비관적 락: 계좌 id 순서로 FOR UPDATE / 낙관적 락: hibernate.order_updates로 UPDATE를 PK 순 정렬.
  */
 @SpringBootTest(properties = "spring.jpa.show-sql=false")
 class TransferDeadlockTest {
@@ -38,6 +41,9 @@ class TransferDeadlockTest {
     @Autowired
     private AccountRepository accountRepository;
 
+    @Autowired
+    private TransferMetrics metrics;
+
     private Account accountA;
     private Account accountB;
 
@@ -46,6 +52,7 @@ class TransferDeadlockTest {
         String suffix = String.valueOf(System.nanoTime() % 1_000_000_000L);
         accountA = accountRepository.save(new Account("DA" + suffix, "A", INITIAL_BALANCE));
         accountB = accountRepository.save(new Account("DB" + suffix, "B", INITIAL_BALANCE));
+        metrics.reset();
     }
 
     @AfterEach
@@ -53,13 +60,15 @@ class TransferDeadlockTest {
         accountRepository.deleteAllById(List.of(accountA.getId(), accountB.getId()));
     }
 
-    @Test
-    @DisplayName("A→B 50건과 B→A 50건을 동시에 이체해도 데드락 없이 모두 성공하고 잔액이 보존된다")
-    void bidirectionalTransfers() throws InterruptedException {
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(LockStrategy.class)
+    @DisplayName("A→B 50건과 B→A 50건을 동시에 이체해도 데드락이 없고 잔액이 성공 건수와 일치한다")
+    void bidirectionalTransfers(LockStrategy strategy) throws InterruptedException {
         ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
         CountDownLatch startSignal = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(REQUEST_COUNT);
-        AtomicInteger successCount = new AtomicInteger();
+        AtomicInteger successAtoB = new AtomicInteger();
+        AtomicInteger successBtoA = new AtomicInteger();
         Map<String, AtomicInteger> failures = new ConcurrentHashMap<>();
 
         for (int i = 0; i < REQUEST_COUNT; i++) {
@@ -69,11 +78,12 @@ class TransferDeadlockTest {
             executor.submit(() -> {
                 try {
                     startSignal.await();
-                    transferService.transfer(from, to, TRANSFER_AMOUNT);
-                    successCount.incrementAndGet();
+                    transferService.transfer(from, to, TRANSFER_AMOUNT, strategy);
+                    (aToB ? successAtoB : successBtoA).incrementAndGet();
                 } catch (Exception e) {
-                    failures.computeIfAbsent(e.getClass().getSimpleName(), k -> new AtomicInteger())
-                            .incrementAndGet();
+                    String key = e instanceof BusinessException be
+                            ? be.getErrorCode().name() : e.getClass().getSimpleName();
+                    failures.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
                 } finally {
                     done.countDown();
                 }
@@ -88,25 +98,38 @@ class TransferDeadlockTest {
 
         long actualA = accountRepository.findById(accountA.getId()).orElseThrow().getBalance();
         long actualB = accountRepository.findById(accountB.getId()).orElseThrow().getBalance();
+        int success = successAtoB.get() + successBtoA.get();
         int failureCount = failures.values().stream().mapToInt(AtomicInteger::get).sum();
+        long net = TRANSFER_AMOUNT * (successBtoA.get() - successAtoB.get()); // A 입장 순증감
+        long expectedA = INITIAL_BALANCE + net;
+        long expectedB = INITIAL_BALANCE - net;
 
         System.out.println();
-        System.out.println("========== 양방향 동시 이체 결과 ==========");
-        System.out.printf("요청 %d건 (A→B %d, B→A %d) / 성공 %d건 / 실패 %s / 120초 내 완료: %s%n",
-                REQUEST_COUNT, (REQUEST_COUNT + 1) / 2, REQUEST_COUNT / 2,
-                successCount.get(), failures.isEmpty() ? "0건" : failures, finished);
-        System.out.printf("걸린 시간: %,d ms%n", elapsedMillis);
+        System.out.printf("========== 양방향 동시 이체 결과 [%s] ==========%n", strategy);
+        System.out.printf("요청 %d건 / 성공 %d건 (A→B %d, B→A %d) / 실패 %d건 %s / 120초 내 완료: %s%n",
+                REQUEST_COUNT, success, successAtoB.get(), successBtoA.get(), failureCount,
+                failures.isEmpty() ? "" : failures, finished);
+        System.out.printf("재시도 %d회 / 걸린 시간: %,d ms%n", metrics.optimisticRetries(), elapsedMillis);
         System.out.printf("%-8s %12s %12s%n", "", "기대값", "실제값");
-        System.out.printf("%-8s %,12d %,12d%n", "A 잔액", INITIAL_BALANCE, actualA);
-        System.out.printf("%-8s %,12d %,12d%n", "B 잔액", INITIAL_BALANCE, actualB);
-        System.out.println("==========================================");
+        System.out.printf("%-8s %,12d %,12d%n", "A 잔액", expectedA, actualA);
+        System.out.printf("%-8s %,12d %,12d%n", "B 잔액", expectedB, actualB);
+        System.out.println("(기대값 = 방향별 성공 건수만큼 이동한 잔액)");
+        System.out.println("================================================");
         System.out.println();
 
         assertAll(
                 () -> assertThat(finished).as("시간 내 완료").isTrue(),
-                () -> assertThat(failureCount).as("실패 건수 (데드락 포함)").isZero(),
-                () -> assertThat(actualA).as("A 잔액").isEqualTo(INITIAL_BALANCE),
-                () -> assertThat(actualB).as("B 잔액").isEqualTo(INITIAL_BALANCE)
+                () -> assertThat(failures).as("데드락 실패 없음").doesNotContainKey("CannotAcquireLockException"),
+                () -> assertThat(actualA).as("A 잔액").isEqualTo(expectedA),
+                () -> assertThat(actualB).as("B 잔액").isEqualTo(expectedB),
+                () -> {
+                    if (strategy == LockStrategy.PESSIMISTIC) {
+                        assertThat(failureCount).as("비관적 락은 전부 성공").isZero();
+                    } else {
+                        assertThat(failures.keySet()).as("낙관적 락 실패 사유는 재시도 소진뿐")
+                                .isSubsetOf(ErrorCode.TRANSFER_CONFLICT.name());
+                    }
+                }
         );
     }
 }

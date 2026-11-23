@@ -13,6 +13,7 @@ import com.kyongseo.banktransfer.account.Account;
 import com.kyongseo.banktransfer.account.AccountRepository;
 import com.kyongseo.banktransfer.global.exception.BusinessException;
 import com.kyongseo.banktransfer.global.exception.ErrorCode;
+import com.kyongseo.banktransfer.idempotency.IdempotencyService;
 import com.kyongseo.banktransfer.transfer.dto.TransferResponse;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,7 +29,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 @ExtendWith(MockitoExtension.class)
-class TransferServiceTest {
+class PessimisticLockTransferServiceTest {
 
     private static final String A = "111111111111";
     private static final String B = "222222222222";
@@ -38,8 +39,11 @@ class TransferServiceTest {
     @Mock
     private AccountRepository accountRepository;
 
+    @Mock
+    private IdempotencyService idempotencyService;
+
     @InjectMocks
-    private TransferService transferService;
+    private PessimisticLockTransferService transferService;
 
     private Account accountA;
     private Account accountB;

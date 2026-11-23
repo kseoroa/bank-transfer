@@ -13,6 +13,8 @@ spring:
     properties:
       hibernate:
         format_sql: true
+        # flush 시 UPDATE를 PK 순으로 정렬 → 낙관적 락 경로에서도 행 락 획득 순서가 고정되어 데드락 방지
+        order_updates: true
 
   data:
     redis:
@@ -21,3 +23,10 @@ spring:
 
 server:
   port: 8080
+
+bank:
+  transfer:
+    lock-strategy: PESSIMISTIC   # 요청에 ?lockStrategy= 가 없을 때의 기본 방식 (PESSIMISTIC | OPTIMISTIC)
+    optimistic:
+      max-attempts: 5            # 최초 시도 포함 최대 시도 횟수
+      backoff-millis: 20         # 재시도 전 대기 (20~40ms 랜덤)

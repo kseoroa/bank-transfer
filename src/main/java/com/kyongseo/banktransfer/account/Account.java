@@ -7,6 +7,7 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Version;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -28,6 +29,10 @@ public class Account {
 
     @Column(nullable = false)
     private long balance;
+
+    /** 낙관적 락용 버전. UPDATE 시 "WHERE version = ?" 조건이 붙고 1 증가한다. */
+    @Version
+    private long version;
 
     public Account(String accountNumber, String ownerName, long initialBalance) {
         if (initialBalance < 0) {
