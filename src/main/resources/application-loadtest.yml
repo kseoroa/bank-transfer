@@ -1,0 +1,8 @@
+# k6 부하 테스트용 프로필: --spring.profiles.active=loadtest
+# SQL 콘솔 출력이 응답 시간을 왜곡하지 않도록 끈다. 그 외 설정(커넥션 풀 등)은 기본값 그대로.
+spring:
+  jpa:
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
