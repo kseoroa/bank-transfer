@@ -17,6 +17,8 @@ The code is organized by feature package:
 
 Unit tests use Mockito with a mocked `AccountRepository` and need no DB (for example `TransferServiceTest`).
 
+`TransferConcurrencyTest` (stage 2) runs 100 concurrent 1,000 KRW transfers from A (100,000) to B against the real MySQL. It asserts the correct result (A=0, B=100,000), so **it fails on purpose until stage 3 adds concurrency control**, and a full `./gradlew test` fails with it. The test class must not be `@Transactional`, because each transfer has to commit in its own transaction for the race to happen.
+
 ## Stack
 
 - Java 21 (Gradle toolchain), Spring Boot 4.2, Gradle 9 wrapper
