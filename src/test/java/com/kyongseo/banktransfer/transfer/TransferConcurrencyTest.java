@@ -78,8 +78,10 @@ class TransferConcurrencyTest {
             });
         }
 
+        long startedAt = System.nanoTime();
         startSignal.countDown();
         boolean finished = done.await(60, TimeUnit.SECONDS);
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
         executor.shutdown();
 
         long actualA = accountRepository.findById(accountA.getId()).orElseThrow().getBalance();
@@ -87,7 +89,7 @@ class TransferConcurrencyTest {
         long expectedA = INITIAL_BALANCE_A - TRANSFER_AMOUNT * REQUEST_COUNT;
         long expectedB = TRANSFER_AMOUNT * REQUEST_COUNT;
 
-        printReport(finished, successCount.get(), failures, expectedA, actualA, expectedB, actualB);
+        printReport(finished, elapsedMillis, successCount.get(), failures, expectedA, actualA, expectedB, actualB);
 
         assertAll(
                 () -> assertThat(actualA).as("A 잔액").isEqualTo(expectedA),
@@ -95,12 +97,13 @@ class TransferConcurrencyTest {
         );
     }
 
-    private void printReport(boolean finished, int success, Map<String, AtomicInteger> failures,
+    private void printReport(boolean finished, long elapsedMillis, int success, Map<String, AtomicInteger> failures,
                              long expectedA, long actualA, long expectedB, long actualB) {
         System.out.println();
         System.out.println("========== 동시 이체 결과 ==========");
         System.out.printf("요청 %d건 / 성공 %d건 / 실패 %s / 60초 내 완료: %s%n",
                 REQUEST_COUNT, success, failures.isEmpty() ? "0건" : failures, finished);
+        System.out.printf("걸린 시간: %,d ms%n", elapsedMillis);
         System.out.printf("%-8s %12s %12s %12s%n", "", "기대값", "실제값", "차이");
         System.out.printf("%-8s %,12d %,12d %,12d%n", "A 잔액", expectedA, actualA, actualA - expectedA);
         System.out.printf("%-8s %,12d %,12d %,12d%n", "B 잔액", expectedB, actualB, actualB - expectedB);

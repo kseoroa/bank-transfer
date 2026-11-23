@@ -16,8 +16,8 @@ public class TransferService {
     private final AccountRepository accountRepository;
 
     /**
-     * 1단계: 락 없이 "조회 → 메모리에서 잔액 변경 → 커밋 시 UPDATE" 흐름.
-     * 동시 요청이 같은 잔액을 읽으면 lost update가 발생한다 (2단계에서 재현 예정).
+     * 비관적 락(SELECT ... FOR UPDATE)으로 두 계좌를 잠근 뒤 이체한다.
+     * 데드락 방지를 위해 이체 방향과 무관하게 항상 id가 작은 계좌부터 락을 건다.
      */
     @Transactional
     public TransferResponse transfer(String fromAccountNumber, String toAccountNumber, long amount) {
@@ -25,8 +25,18 @@ public class TransferService {
             throw new BusinessException(ErrorCode.SAME_ACCOUNT_TRANSFER);
         }
 
-        Account from = findAccount(fromAccountNumber);
-        Account to = findAccount(toAccountNumber);
+        Long fromId = findAccountId(fromAccountNumber);
+        Long toId = findAccountId(toAccountNumber);
+
+        Account from;
+        Account to;
+        if (fromId < toId) {
+            from = lockAccount(fromId);
+            to = lockAccount(toId);
+        } else {
+            to = lockAccount(toId);
+            from = lockAccount(fromId);
+        }
 
         from.withdraw(amount);
         to.deposit(amount);
@@ -34,8 +44,13 @@ public class TransferService {
         return new TransferResponse(fromAccountNumber, toAccountNumber, amount, from.getBalance());
     }
 
-    private Account findAccount(String accountNumber) {
-        return accountRepository.findByAccountNumber(accountNumber)
+    private Long findAccountId(String accountNumber) {
+        return accountRepository.findIdByAccountNumber(accountNumber)
+                .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
+    }
+
+    private Account lockAccount(Long id) {
+        return accountRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
     }
 }
